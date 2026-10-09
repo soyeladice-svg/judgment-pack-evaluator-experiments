@@ -6,7 +6,12 @@ not see, an implementation that answers with a disposition where an error is exp
 agree with each other and not with the RFC. The cases file is held to the script that writes it,
 so a row's expected answer cannot be edited in place.
 """
+import contextlib
+import io
 import json
+import shlex
+import tempfile
+from pathlib import Path
 import os
 import subprocess
 import sys
@@ -212,6 +217,109 @@ class CasesFileTests(unittest.TestCase):
                 self.assertIn(name, ids)
                 self.assertIn(known["verdict"], ("AGREE-OFF-RFC", "DIVERGENT"))
                 self.assertTrue(known["reason"])
+
+
+
+class DriverExitBehaviorTests(unittest.TestCase):
+    """Exercise main() with stand-in implementations, not just verdict helpers."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.pyrepo = self.root / "python"
+        package = self.pyrepo / "jps_evaluator"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        self.python_main = package / "__main__.py"
+        self.go = self.root / "standin.sh"
+        self.go_output = self.root / "go.json"
+        self.cases_path = self.root / "cases.json"
+
+    def exercise(self, *, go=GO_RESULT, python=PY_RESULT, known=None, rows=None):
+        # The fake executable refers to an absolute output path because the driver
+        # launches each case with a new, otherwise empty temporary cwd.
+        self.go_output.write_text(go, encoding="utf-8")
+        self.go.write_text(
+            "#!/bin/sh\ncat " + shlex.quote(str(self.go_output)) + "\n",
+            encoding="utf-8",
+        )
+        self.go.chmod(0o755)
+        self.python_main.write_text(
+            "import sys\nsys.stdout.write(" + repr(python) + ")\n",
+            encoding="utf-8",
+        )
+        cases = [{
+            "id": "row-1",
+            "origin": "Conformance, synthetic test",
+            "optIn": True,
+            "pack": "{}",
+            "facts": "{}",
+            "expected": {"disposition": OUTCOME},
+        }] if rows is None else rows
+        self.cases_path.write_text(
+            json.dumps({"cases": cases, "known": known or {}}),
+            encoding="utf-8",
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = driver.main(
+                ["rfc0016_harness.py", str(self.go), str(self.pyrepo), str(self.cases_path)]
+            )
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_expected_verdict_exits_zero(self):
+        code, stdout, stderr = self.exercise()
+        self.assertEqual(code, 0, (stdout, stderr))
+        self.assertIn("matches-rfc", stdout)
+        self.assertNotIn("FAILED:", stdout)
+
+    def test_unlisted_verdicts_fail_the_run(self):
+        different_go = GO_RESULT.replace('"0.10"', '"0.1"')
+        different_python = PY_RESULT.replace('"0.10"', '"0.1"')
+        for title, go, python, verdict in (
+            ("disagree", different_go, PY_RESULT, "DIVERGENT"),
+            ("agree_off_rfc", different_go, different_python, "AGREE-OFF-RFC"),
+        ):
+            with self.subTest(kind=title):
+                code, stdout, _ = self.exercise(go=go, python=python)
+                self.assertEqual(code, 1)
+                self.assertIn(verdict, stdout)
+                self.assertIn("FAILED:", stdout)
+                self.assertIn("row-1", stdout)
+
+    def test_declared_known_divergence_can_pass(self):
+        code, stdout, _ = self.exercise(
+            go=GO_RESULT.replace('"0.10"', '"0.1"'),
+            known={"row-1": {"verdict": "DIVERGENT", "reason": "synthetic mismatch"}},
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("known: synthetic mismatch", stdout)
+        self.assertNotIn("FAILED:", stdout)
+
+    def test_stale_known_verdict_fails(self):
+        code, stdout, _ = self.exercise(
+            known={"row-1": {"verdict": "DIVERGENT", "reason": "stale exception"}}
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("matches-rfc", stdout)
+        self.assertIn("FAILED:", stdout)
+        self.assertIn("row-1", stdout)
+
+    def test_empty_cases_are_refused_before_running(self):
+        code, stdout, stderr = self.exercise(rows=[])
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("refused: the cases file holds zero rows", stderr)
+
+    def test_a_known_name_without_a_row_is_refused(self):
+        code, stdout, stderr = self.exercise(
+            known={"not-a-row": {"verdict": "DIVERGENT", "reason": "typo"}}
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn('refused: "known" names rows the cases file does not hold', stderr)
+        self.assertIn("not-a-row", stderr)
 
 
 if __name__ == "__main__":
